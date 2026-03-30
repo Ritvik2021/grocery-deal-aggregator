@@ -24,6 +24,8 @@ app.get('/health', (_req, res) => {
 app.use('/api/stores', storesRouter);
 app.use('/api/deals', dealsRouter);
 app.use('/api/admin', adminRouter);
+// Public refresh shortcut (adminRouter handles /public-refresh)
+app.use('/api', adminRouter);
 
 // 404 handler
 app.use((_req, res) => {

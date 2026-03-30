@@ -19,10 +19,14 @@ export function DealCard({ deal }: DealCardProps) {
   const savingsPct = deal.savings_pct ? Math.round(deal.savings_pct) : null;
 
   const validUntil = deal.valid_to
-    ? new Date(deal.valid_to).toLocaleDateString('en-CA', {
-        month: 'short',
-        day: 'numeric',
-      })
+    ? new Date(deal.valid_to).toLocaleDateString('en-CA', { month: 'short', day: 'numeric' })
+    : null;
+
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const startsAt = deal.valid_from ? new Date(deal.valid_from) : null;
+  const validFrom = startsAt && startsAt > today
+    ? startsAt.toLocaleDateString('en-CA', { month: 'short', day: 'numeric' })
     : null;
 
   return (
@@ -93,10 +97,12 @@ export function DealCard({ deal }: DealCardProps) {
           )}
         </div>
 
-        {/* Valid until */}
-        {validUntil && (
+        {/* Validity dates */}
+        {validFrom ? (
+          <p className="text-xs text-amber-600 mt-1">Starts {validFrom}{validUntil ? ` – ${validUntil}` : ''}</p>
+        ) : validUntil ? (
           <p className="text-xs text-gray-400 mt-1">Valid until {validUntil}</p>
-        )}
+        ) : null}
       </div>
     </div>
   );

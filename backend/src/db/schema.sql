@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS deals (
   unit_size      TEXT,
   image_url      TEXT,
   category       TEXT,
+  subcategory    TEXT,
   valid_from     DATE,
   valid_to       DATE,
   source         TEXT NOT NULL DEFAULT 'flipp',
@@ -40,8 +41,9 @@ CREATE TABLE IF NOT EXISTS deals (
   UNIQUE(store_id, external_id, valid_from)
 );
 
-CREATE INDEX IF NOT EXISTS idx_deals_store      ON deals(store_id);
-CREATE INDEX IF NOT EXISTS idx_deals_valid_to   ON deals(valid_to);
+CREATE INDEX IF NOT EXISTS idx_deals_store       ON deals(store_id);
+CREATE INDEX IF NOT EXISTS idx_deals_valid_to    ON deals(valid_to);
 CREATE INDEX IF NOT EXISTS idx_deals_savings_pct ON deals(savings_pct DESC NULLS LAST);
-CREATE INDEX IF NOT EXISTS idx_deals_category   ON deals(category);
-CREATE INDEX IF NOT EXISTS idx_deals_name_trgm  ON deals USING gin(to_tsvector('english', name));
+CREATE INDEX IF NOT EXISTS idx_deals_category    ON deals(category);
+CREATE INDEX IF NOT EXISTS idx_deals_subcategory ON deals(subcategory);
+CREATE INDEX IF NOT EXISTS idx_deals_name_trgm   ON deals USING gin(to_tsvector('english', name));

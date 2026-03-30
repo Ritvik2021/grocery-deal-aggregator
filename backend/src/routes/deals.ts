@@ -3,30 +3,39 @@ import { pool } from '../db/client';
 
 const router = Router();
 
+// Normalise a query param that may be a string or string[] into a string[].
+function toArray(val: unknown): string[] {
+  if (!val) return [];
+  if (Array.isArray(val)) return val as string[];
+  return [val as string];
+}
+
 // GET /api/deals
-// Query params: store (slug), category, minSavings (%), search, limit, offset
+// Query params: stores (repeatable), l1 (repeatable), l2 (repeatable),
+//               minSavings (%), search, limit, offset
 router.get('/', async (req: Request, res: Response) => {
   try {
-    const {
-      store,
-      category,
-      minSavings,
-      search,
-      limit = '48',
-      offset = '0',
-    } = req.query as Record<string, string>;
+    const { minSavings, search, limit = '48', offset = '0' } = req.query as Record<string, string>;
+
+    const stores = toArray(req.query.stores);
+    const l1s    = toArray(req.query.l1);
+    const l2s    = toArray(req.query.l2);
 
     const conditions: string[] = ['d.valid_to >= CURRENT_DATE'];
     const params: unknown[] = [];
     let idx = 1;
 
-    if (store) {
-      conditions.push(`s.slug = $${idx++}`);
-      params.push(store);
+    if (stores.length) {
+      conditions.push(`s.slug = ANY($${idx++}::text[])`);
+      params.push(stores);
     }
-    if (category) {
-      conditions.push(`d.category ILIKE $${idx++}`);
-      params.push(`%${category}%`);
+    if (l1s.length) {
+      conditions.push(`d.category = ANY($${idx++}::text[])`);
+      params.push(l1s);
+    }
+    if (l2s.length) {
+      conditions.push(`d.subcategory = ANY($${idx++}::text[])`);
+      params.push(l2s);
     }
     if (minSavings) {
       conditions.push(`d.savings_pct >= $${idx++}`);
@@ -39,7 +48,7 @@ router.get('/', async (req: Request, res: Response) => {
       params.push(search);
     }
 
-    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+    const where = `WHERE ${conditions.join(' AND ')}`;
 
     const countResult = await pool.query(
       `SELECT COUNT(*)::int AS total
@@ -49,14 +58,15 @@ router.get('/', async (req: Request, res: Response) => {
       params
     );
 
-    const limitNum = Math.min(Number(limit) || 48, 100);
+    const limitNum  = Math.min(Number(limit) || 48, 100);
     const offsetNum = Number(offset) || 0;
     params.push(limitNum, offsetNum);
 
     const result = await pool.query(
       `SELECT
          d.id, d.name, d.description, d.current_price, d.original_price,
-         d.savings, d.savings_pct, d.unit_size, d.image_url, d.category,
+         d.savings, d.savings_pct, d.unit_size, d.image_url,
+         d.category, d.subcategory,
          d.valid_from, d.valid_to, d.source, d.fetched_at,
          s.slug AS store_slug, s.name AS store_name, s.logo_url AS store_logo
        FROM deals d
@@ -76,6 +86,34 @@ router.get('/', async (req: Request, res: Response) => {
   } catch (err) {
     console.error('[GET /deals]', err);
     res.status(500).json({ error: 'Failed to fetch deals' });
+  }
+});
+
+// GET /api/deals/categories
+// Returns [ { l1: string, l2s: string[] }, ... ] for currently-valid deals.
+router.get('/categories', async (_req: Request, res: Response) => {
+  try {
+    const result = await pool.query(
+      `SELECT category AS l1, subcategory AS l2
+       FROM deals
+       WHERE category IS NOT NULL AND category <> ''
+         AND valid_to >= CURRENT_DATE
+       GROUP BY category, subcategory
+       ORDER BY category, subcategory NULLS LAST`
+    );
+
+    // Group rows into { l1, l2s[] }
+    const map = new Map<string, string[]>();
+    for (const row of result.rows as { l1: string; l2: string | null }[]) {
+      if (!map.has(row.l1)) map.set(row.l1, []);
+      if (row.l2) map.get(row.l1)!.push(row.l2);
+    }
+
+    const categories = Array.from(map.entries()).map(([l1, l2s]) => ({ l1, l2s }));
+    res.json(categories);
+  } catch (err) {
+    console.error('[GET /deals/categories]', err);
+    res.status(500).json({ error: 'Failed to fetch categories' });
   }
 });
 
