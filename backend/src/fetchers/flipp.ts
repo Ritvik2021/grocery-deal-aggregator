@@ -1,9 +1,17 @@
 import axios from 'axios';
 import { pool } from '../db/client';
+import { normalizeCategory } from './normalizeCategory';
 
 const FLIPP_BASE = 'https://backflipp.wishabi.com/flipp';
 
-// Target retailers — search query and display name
+const HEADERS = {
+  'User-Agent':
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 ' +
+    '(KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+  Accept: 'application/json',
+};
+
+// Target retailers — search query used to discover their flyer IDs
 const TARGET_STORES: { slug: string; name: string; query: string }[] = [
   { slug: 'walmart',                  name: 'Walmart',                  query: 'Walmart' },
   { slug: 'real-canadian-superstore', name: 'Real Canadian Superstore', query: 'Real Canadian Superstore' },
@@ -12,31 +20,24 @@ const TARGET_STORES: { slug: string; name: string; query: string }[] = [
   { slug: 'costco',                   name: 'Costco',                   query: 'Costco' },
 ];
 
-// Shape returned by backflipp.wishabi.com/flipp/items/search
-interface BackFlippItem {
-  id?: number;
-  flyer_item_id?: number;
-  name?: string;
-  current_price?: number;
-  original_price?: number;
-  pre_price_text?: string;
-  post_price_text?: string;
-  sale_story?: string;
-  clean_image_url?: string;    // primary product image
-  clipping_image_url?: string; // fallback
-  _L1?: string;                // top-level category e.g. "Health & Beauty"
-  _L2?: string;                // subcategory e.g. "Food Items"
+// Shape returned by /flipp/items/search — used only for flyer ID discovery
+interface SearchItem {
+  flyer_id?: number;
+  merchant_name?: string;
   valid_from?: string;
   valid_to?: string;
-  merchant_name?: string;
-  flyer_id?: number;
 }
 
-interface BackFlippResponse {
-  items?: BackFlippItem[];
-  // fallback shapes
-  data?: BackFlippItem[];
-  results?: BackFlippItem[];
+// Shape returned by /flipp/flyers/{id} — the full-flyer endpoint
+interface FlyerItem {
+  id?: number;
+  flyer_id?: number;
+  name?: string;
+  price?: string | number | null;
+  discount?: string | number | null;
+  cutout_image_url?: string;
+  valid_from?: string;
+  valid_to?: string;
 }
 
 async function upsertStore(slug: string, name: string) {
@@ -50,8 +51,6 @@ async function upsertStore(slug: string, name: string) {
   return result.rows[0].id as number;
 }
 
-// We keep the flyers table but use a synthetic pub_id (negative store_id) so
-// each store has one "current week" flyer that gets refreshed on every fetch.
 async function upsertSyntheticFlyer(storeId: number, validFrom: string | null, validTo: string | null) {
   const syntheticPubId = storeId * -1;
   const result = await pool.query(
@@ -67,26 +66,18 @@ async function upsertSyntheticFlyer(storeId: number, validFrom: string | null, v
   return result.rows[0].id as number;
 }
 
-async function upsertDeals(flyerId: number, storeId: number, items: BackFlippItem[]) {
+async function upsertDeals(flyerId: number, storeId: number, items: FlyerItem[]) {
   let inserted = 0;
   for (const item of items) {
-    const currentPrice  = item.current_price  ?? null;
-    const originalPrice = item.original_price ?? null;
-    const imageUrl      = item.clean_image_url ?? item.clipping_image_url ?? null;
-    const validFrom     = item.valid_from ?? null;
-    const validTo       = item.valid_to   ?? null;
-    const category      = item._L1 ?? null;
-    const subcategory   = item._L2 ?? null;
-    const externalId    = item.id != null ? String(item.id) : null;
+    const externalId = item.id != null ? String(item.id) : null;
+    if (!externalId || !item.name?.trim()) continue;
 
-    if (!externalId || !item.name) continue;
+    const currentPrice = item.price != null ? parseFloat(String(item.price)) : null;
+    const imageUrl = item.cutout_image_url ?? null;
+    const validFrom = item.valid_from ?? null;
+    const validTo = item.valid_to ?? null;
 
-    const savings =
-      originalPrice && currentPrice ? originalPrice - currentPrice : null;
-    const savingsPct =
-      originalPrice && currentPrice && originalPrice > 0
-        ? ((originalPrice - currentPrice) / originalPrice) * 100
-        : null;
+    const { category, subcategory } = normalizeCategory(item.name);
 
     try {
       await pool.query(
@@ -94,32 +85,15 @@ async function upsertDeals(flyerId: number, storeId: number, items: BackFlippIte
            (flyer_id, store_id, external_id, name,
             current_price, original_price, savings, savings_pct,
             image_url, category, subcategory, valid_from, valid_to, source)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'flipp')
+         VALUES ($1,$2,$3,$4,$5,NULL,NULL,NULL,$6,$7,$8,$9,$10,'flipp')
          ON CONFLICT (store_id, external_id, valid_from) DO UPDATE SET
            name           = EXCLUDED.name,
            current_price  = EXCLUDED.current_price,
-           original_price = EXCLUDED.original_price,
-           savings        = EXCLUDED.savings,
-           savings_pct    = EXCLUDED.savings_pct,
            image_url      = EXCLUDED.image_url,
            category       = EXCLUDED.category,
            subcategory    = EXCLUDED.subcategory,
            fetched_at     = NOW()`,
-        [
-          flyerId,
-          storeId,
-          externalId,
-          item.name,
-          currentPrice,
-          originalPrice,
-          savings !== null ? savings.toFixed(2) : null,
-          savingsPct !== null ? savingsPct.toFixed(2) : null,
-          imageUrl,
-          category,
-          subcategory,
-          validFrom,
-          validTo,
-        ]
+        [flyerId, storeId, externalId, item.name.trim(), currentPrice, imageUrl, category, subcategory, validFrom, validTo]
       );
       inserted++;
     } catch {
@@ -129,6 +103,65 @@ async function upsertDeals(flyerId: number, storeId: number, items: BackFlippIte
   return inserted;
 }
 
+async function discoverFlyerIds(store: { query: string; name: string }, postalCode: string): Promise<number[]> {
+  try {
+    const res = await axios.get<unknown>(
+      `${FLIPP_BASE}/items/search`,
+      {
+        params: { locale: 'en-ca', postal_code: postalCode, q: store.query },
+        headers: HEADERS,
+        timeout: 30_000,
+      }
+    );
+    const raw = res.data;
+    const items: SearchItem[] = Array.isArray(raw)
+      ? raw
+      : ((raw as any)?.items ?? (raw as any)?.data ?? (raw as any)?.results ?? []);
+
+    const now = new Date();
+    const storeNameLower = store.name.toLowerCase();
+
+    const ids = [...new Set(
+      items
+        .filter((i) => {
+          // Only keep items from the target merchant
+          const merchant = (i.merchant_name ?? '').toLowerCase();
+          if (!merchant.includes(storeNameLower) && !storeNameLower.includes(merchant)) return false;
+          // Only keep currently valid flyers
+          if (i.valid_to && new Date(i.valid_to) < now) return false;
+          return true;
+        })
+        .map((i) => i.flyer_id)
+        .filter((id): id is number => !!id)
+    )];
+    return ids;
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[Flipp] Failed to discover flyer IDs for "${store.query}": ${msg}`);
+    return [];
+  }
+}
+
+async function fetchFlyerItems(flyerId: number): Promise<FlyerItem[]> {
+  try {
+    const res = await axios.get<unknown>(
+      `${FLIPP_BASE}/flyers/${flyerId}`,
+      { headers: HEADERS, timeout: 30_000 }
+    );
+    const raw = res.data;
+    if (Array.isArray(raw)) return raw as FlyerItem[];
+    if (raw && typeof raw === 'object') {
+      const obj = raw as any;
+      return obj.flyer_items ?? obj.items ?? obj.data ?? [];
+    }
+    return [];
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[Flipp] Failed to fetch items for flyer ${flyerId}: ${msg}`);
+    return [];
+  }
+}
+
 export async function fetchAndStoreFlippDeals(): Promise<void> {
   const postalCode = process.env.FLIPP_POSTAL_CODE || 'M5V2T6';
   console.log(`[Flipp] Starting fetch for postal code: ${postalCode}`);
@@ -136,81 +169,44 @@ export async function fetchAndStoreFlippDeals(): Promise<void> {
   let totalDeals = 0;
 
   for (const store of TARGET_STORES) {
-    console.log(`[Flipp] Searching items for: ${store.name}`);
+    console.log(`[Flipp] Discovering flyer IDs for: ${store.name}`);
 
-    let items: BackFlippItem[] = [];
-
-    try {
-      const res = await axios.get<BackFlippResponse>(
-        `${FLIPP_BASE}/items/search`,
-        {
-          params: {
-            locale:      'en-ca',
-            postal_code: postalCode,
-            q:           store.query,
-          },
-          headers: {
-            'User-Agent':
-              'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 ' +
-              '(KHTML, like Gecko) Chrome/124.0 Safari/537.36',
-            Accept: 'application/json',
-          },
-          timeout: 30_000,
-        }
-      );
-
-      const raw = res.data as unknown;
-
-      if (Array.isArray(raw)) {
-        items = raw as BackFlippItem[];
-      } else if (raw && typeof raw === 'object') {
-        const obj = raw as BackFlippResponse;
-        items = obj.items ?? obj.data ?? obj.results ?? [];
-        if (items.length === 0) {
-          console.warn(`[Flipp] Unexpected response shape for ${store.name}. Keys:`, Object.keys(obj).join(', '));
-        }
-      } else if (typeof raw === 'string') {
-        if ((raw as string).trimStart().startsWith('<')) {
-          console.error(`[Flipp] Got HTML response for ${store.name} — API may be blocking requests`);
-          continue;
-        }
-        try {
-          const parsed = JSON.parse(raw as string);
-          items = Array.isArray(parsed) ? parsed : (parsed.items ?? parsed.data ?? parsed.results ?? []);
-        } catch {
-          console.error(`[Flipp] Unparseable response for ${store.name}`);
-          continue;
-        }
-      }
-
-      console.log(`[Flipp]   → ${items.length} items found`);
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error(`[Flipp] Failed to fetch items for ${store.name}: ${msg}`);
+    // Step 1: Use search to find which flyer IDs belong to this store
+    const flyerIds = await discoverFlyerIds(store, postalCode);
+    if (flyerIds.length === 0) {
+      console.warn(`[Flipp]   → No flyer IDs found for ${store.name}, skipping`);
       continue;
     }
+    console.log(`[Flipp]   → Found ${flyerIds.length} flyer(s): ${flyerIds.join(', ')}`);
 
-    if (items.length === 0) continue;
+    // Step 2: Fetch all items from each flyer using the full-flyer endpoint
+    let allItems: FlyerItem[] = [];
+    for (const flyerId of flyerIds) {
+      const items = await fetchFlyerItems(flyerId);
+      console.log(`[Flipp]   → Flyer ${flyerId}: ${items.length} items`);
+      allItems = allItems.concat(items);
+    }
 
-    // Deduplicate: Flipp sometimes returns the same product multiple times
-    // with different flyer_item_ids (multiple pages). Key on name+price+valid_from.
+    // Deduplicate across flyers by item id
     const seen = new Set<string>();
-    items = items.filter((item) => {
-      const key = `${(item.name ?? '').toLowerCase()}|${item.current_price ?? ''}|${item.valid_from ?? ''}`;
-      if (seen.has(key)) return false;
+    allItems = allItems.filter((item) => {
+      const key = String(item.id ?? '');
+      if (!key || seen.has(key)) return false;
       seen.add(key);
       return true;
     });
-    console.log(`[Flipp]   → ${items.length} items after dedup`);
+    console.log(`[Flipp]   → ${allItems.length} unique items after dedup`);
 
-    // Derive a date range from the items for the synthetic flyer record
-    const dates = items.flatMap((i) => [i.valid_from, i.valid_to]).filter(Boolean) as string[];
+    if (allItems.length === 0) continue;
+
+    // Derive date range for the synthetic flyer record
+    const dates = allItems.flatMap((i) => [i.valid_from, i.valid_to]).filter(Boolean) as string[];
     const validFrom = dates.length ? dates.reduce((a, b) => (a < b ? a : b)) : null;
     const validTo   = dates.length ? dates.reduce((a, b) => (a > b ? a : b)) : null;
 
     const storeId = await upsertStore(store.slug, store.name);
-    const flyerId = await upsertSyntheticFlyer(storeId, validFrom, validTo);
-    const count   = await upsertDeals(flyerId, storeId, items);
+    const dbFlyerId = await upsertSyntheticFlyer(storeId, validFrom, validTo);
+    const count = await upsertDeals(dbFlyerId, storeId, allItems);
 
     console.log(`[Flipp]   → ${count} deals upserted for ${store.name}`);
     totalDeals += count;
